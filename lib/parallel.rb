@@ -489,7 +489,7 @@ module Parallel
         if (job = job_factory.next)
           item, index = job
           instrument_start item, index, options
-          ractor.send [callback, item, index, options[:return_results]]
+          ractor.send [callback, item, index, options[:return_results], options[:with_index]]
         else # not enough work, `receive` would hang
           ractor_stop ractor
           ports.delete port
@@ -511,7 +511,7 @@ module Parallel
         # send new
         item_next, index_next = job
         instrument_start item_next, index_next, options
-        done_ractor.send([callback, item_next, index_next, options[:return_results]])
+        done_ractor.send([callback, item_next, index_next, options[:return_results], options[:with_index]])
       end
 
       # finish
@@ -533,10 +533,10 @@ module Parallel
       args = use_port ? [Ractor::Port.new] : []
       ractor = Ractor.new(*args) do |port|
         loop do
-          (klass, method_name), item, index, return_results = receive
+          (klass, method_name), item, index, return_results, with_index = receive
           break if index == :break
           begin
-            value = klass.send(method_name, item)
+            value = with_index ? klass.send(method_name, item, index) : klass.send(method_name, item)
             value = nil unless return_results
             result = [nil, value, item, index]
           rescue StandardError => e
