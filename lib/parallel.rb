@@ -245,7 +245,7 @@ module Parallel
     end
 
     def each(array, options = {}, &block)
-      map(array, options.merge(preserve_results: false), &block)
+      map(array, options.merge(discard_results: true), &block)
     end
 
     def any?(*args, &block)
@@ -287,10 +287,19 @@ module Parallel
         end
       end
 
+      raise ArgumentError, "worker count must be a non-negative Integer" unless size.is_a?(Integer) && size >= 0
+
       job_factory = JobFactory.new(source, options[:mutex])
       size = [job_factory.size, size].min
 
-      options[:return_results] = (options[:preserve_results] != false || !!options[:finish])
+      invalid_ractor_call = block && options[:ractor]
+      invalid_ractor_call ||= size > 0 && !options[:ractor]
+      if method == :in_ractors && invalid_ractor_call
+        raise ArgumentError, "pass either a block for direct execution or `ractor: [ClassName, :method_name]`"
+      end
+
+      discard_results = options[:discard_results]
+      options[:discard_results] = discard_results && !options[:finish] # finish callback needs the results
       add_progress_bar!(job_factory, options)
 
       result =
@@ -306,7 +315,7 @@ module Parallel
 
       return result.value if result.is_a?(Break)
       raise result if result.is_a?(Exception)
-      options[:return_results] ? result : source
+      discard_results ? source : result
     end
 
     def map_with_index(array, options = {}, &block)
@@ -427,9 +436,14 @@ module Parallel
       begin
         while (set = job_factory.next)
           item, index = set
-          results << with_instrumentation(item, index, options) do
-            call_with_index(item, index, options, &block)
+          result = with_instrumentation(item, index, options) do
+            if (callback = options[:ractor])
+              call_ractor_callback(callback, item, index, options)
+            else
+              call_with_index(item, index, options, &block)
+            end
           end
+          results << result unless options[:discard_results]
         end
       rescue StandardError
         exception = $!
@@ -454,7 +468,7 @@ module Parallel
             result = with_instrumentation item, index, options do
               call_with_index(item, index, options, &block)
             end
-            results_mutex.synchronize { results[index] = result }
+            results_mutex.synchronize { results[index] = result } unless options[:discard_results]
           rescue StandardError
             exception = $!
           end
@@ -470,9 +484,6 @@ module Parallel
       results_mutex = Mutex.new # arrays are not thread-safe on jRuby
 
       callback = options[:ractor]
-      if block_given? || !callback
-        raise ArgumentError, "pass the code you want to execute as `ractor: [ClassName, :method_name]`"
-      end
 
       use_port = defined?(Ractor::Port)
 
@@ -483,46 +494,52 @@ module Parallel
         ports[port] = ractor
       end
 
-      # start
-      ports.dup.each do |port, ractor|
-        if (job = job_factory.next)
-          item, index = job
-          instrument_start item, index, options
-          ractor.send [callback, item, index, options[:with_index]]
-        else # not enough work, `receive` would hang
+      begin
+        # start
+        ports.dup.each do |port, ractor|
+          if (job = job_factory.next)
+            item, index = job
+            instrument_start item, index, options
+            ractor.send [callback, item, index, options[:with_index], options[:discard_results]]
+          else # not enough work, `receive` would hang
+            ractor_stop ractor
+            ports.delete port
+          end
+        end
+
+        # receive result and send new items to done ractors
+        while (job = job_factory.next)
+          # receive result
+          done_port, (exception, result, item_prev, index_prev) = Ractor.select(*ports.keys)
+          done_ractor = ports[done_port]
+          if exception
+            ractor_stop done_ractor
+            ports.delete done_port
+            break
+          end
+          ractor_result item_prev, index_prev, result, results, results_mutex, options
+
+          # send new
+          item_next, index_next = job
+          instrument_start item_next, index_next, options
+          done_ractor.send([callback, item_next, index_next, options[:with_index], options[:discard_results]])
+        end
+
+        # finish
+        ports.dup.each do |port, ractor|
+          (new_exception, result, item, index) = use_port ? port.receive : ractor.take
+          exception ||= new_exception
+          ractor_result item, index, result, results, results_mutex, options unless new_exception
           ractor_stop ractor
           ports.delete port
         end
-      end
-
-      # receive result and send new items to done ractors
-      while (job = job_factory.next)
-        # receive result
-        done_port, (exception, result, item_prev, index_prev) = Ractor.select(*ports.keys)
-        done_ractor = ports[done_port]
-        if exception
-          ractor_stop done_ractor
-          ports.delete done_port
-          break
+      ensure
+        ports.each_value do |ractor|
+          ractor_stop(ractor)
+          ractor.take unless use_port
+        rescue Ractor::ClosedError, Ractor::RemoteError
+          nil
         end
-        ractor_result item_prev, index_prev, result, results, results_mutex, options
-
-        # send new
-        item_next, index_next = job
-        instrument_start item_next, index_next, options
-        done_ractor.send([callback, item_next, index_next, options[:with_index]])
-      end
-
-      # finish
-      ports.each do |port, ractor|
-        (new_exception, result, item, index) = use_port ? port.receive : ractor.take
-        exception ||= new_exception
-        if new_exception
-          ractor_stop ractor
-          next
-        end
-        ractor_result item, index, result, results, results_mutex, options
-        ractor_stop ractor
       end
 
       exception || results
@@ -532,10 +549,11 @@ module Parallel
       args = use_port ? [Ractor::Port.new] : []
       ractor = Ractor.new(*args) do |port|
         loop do
-          (klass, method_name), item, index, with_index = receive
+          (klass, method_name), item, index, with_index, discard_results = receive
           break if index == :break
           begin
             value = with_index ? klass.send(method_name, item, index) : klass.send(method_name, item)
+            value = nil if discard_results
             result = [nil, value, item, index]
           rescue StandardError => e
             result = [e, nil, item, index]
@@ -552,11 +570,13 @@ module Parallel
 
     def ractor_result(item, index, result, results, results_mutex, options)
       instrument_finish item, index, result, options
-      results_mutex.synchronize { results[index] = (options[:preserve_results] == false ? nil : result) }
+      results_mutex.synchronize { results[index] = result } unless options[:discard_results]
     end
 
     def ractor_stop(ractor)
       ractor.send([[nil, nil], nil, :break])
+    rescue Ractor::ClosedError
+      nil
     end
 
     def work_in_processes(job_factory, options, &blk)
@@ -587,7 +607,8 @@ module Parallel
                 result = with_instrumentation item, index, options do
                   worker.work(job_factory.pack(item, index))
                 end
-                results_mutex.synchronize { results[index] = result } # arrays are not threads safe on jRuby
+                # arrays are not threads safe on jRuby
+                results_mutex.synchronize { results[index] = result } unless options[:discard_results]
               rescue StandardError => e
                 exception = e
                 if exception.is_a?(Kill)
@@ -625,6 +646,13 @@ module Parallel
         workers << worker(job_factory, options.merge(started_workers: workers, worker_number: i), &block)
       end
       workers
+    rescue Exception # rubocop:disable Lint/RescueException
+      workers.each do |worker|
+        worker.stop
+      rescue StandardError
+        nil
+      end
+      raise
     end
 
     def worker(job_factory, options, &block)
@@ -652,6 +680,19 @@ module Parallel
       child_write.close
 
       Worker.new(parent_read, parent_write, pid, options[:serializer])
+    rescue Exception # rubocop:disable Lint/RescueException
+      [child_read, parent_write, parent_read, child_write].compact.each do |io|
+        io.close unless io.closed?
+      end
+      if pid
+        UserInterruptHandler.kill(pid)
+        begin
+          Process.wait(pid)
+        rescue Errno::ECHILD
+          nil
+        end
+      end
+      raise
     end
 
     def process_incoming_jobs(read, write, job_factory, options, &block)
@@ -693,18 +734,25 @@ module Parallel
       args = [item]
       args << index if options[:with_index]
       results = block.call(*args)
-      if options[:return_results]
-        results
-      else
+      if options[:discard_results]
         nil # avoid GC overhead of passing large results around
+      else
+        results
       end
+    end
+
+    def call_ractor_callback(callback, item, index, options)
+      klass, method_name = callback
+      args = [item]
+      args << index if options[:with_index]
+      klass.send(method_name, *args)
     end
 
     def with_instrumentation(item, index, options)
       instrument_start(item, index, options)
       result = yield
       instrument_finish(item, index, result, options)
-      result unless options[:preserve_results] == false
+      result unless options[:discard_results]
     end
 
     def instrument_finish(item, index, result, options)
